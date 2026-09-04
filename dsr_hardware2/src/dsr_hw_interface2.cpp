@@ -100,6 +100,15 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
         } else if ("update_rate" == parameter.first) {
             RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"update_rate : %s", parameter.second.c_str());
             update_rate_ = std::stoi(parameter.second);
+        } else if ("rt_mode" == parameter.first) {
+            RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "rt_mode : %s", parameter.second.c_str());
+            rt_mode_ = parameter.second;
+            std::transform(rt_mode_.begin(), rt_mode_.end(), rt_mode_.begin(), ::tolower);
+            if (rt_mode_ != "auto" && rt_mode_ != "on" && rt_mode_ != "off") {
+                RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"),
+                    "rt_mode must be one of auto|on|off, got '%s'", rt_mode_.c_str());
+                return CallbackReturn::ERROR;
+            }
         } else {
             RCLCPP_WARN(rclcpp::get_logger("dsr_hw_interface2"), "Unexpected Parameter....\
                  key : %s, value : %s",parameter.first.c_str(), parameter.second.c_str());
@@ -267,6 +276,30 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    m_nVersionDRCF = %d", m_nVersionDRCF);  //ex> M2.40 = 120400, M2.50 = 120500  
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n");
 
+    //--- Decide whether the realtime stream is usable ----------------------
+    // Not probed, because it cannot be: on a controller that does not serve the
+    // RT stream, connect_rt_control() still returns true and read_data_rt()
+    // returns a zero-filled buffer instead of nullptr. Nothing fails, and joint
+    // feedback silently reads 0.0 forever. The version is the only honest signal.
+    if (mode_ == "virtual") {
+        use_rt_ = false;                       // the emulator has no RT stream
+    } else if (rt_mode_ == "on") {
+        use_rt_ = true;
+    } else if (rt_mode_ == "off") {
+        use_rt_ = false;
+    } else {                                   // "auto"
+        use_rt_ = (m_nVersionDRCF >= 3000000);
+    }
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),
+        "    realtime stream: %s  (rt_mode=%s, mode=%s, DRCF=%d)",
+        use_rt_ ? "ENABLED" : "DISABLED -- reading joint state over DRL/TCP",
+        rt_mode_.c_str(), mode_.c_str(), m_nVersionDRCF);
+    if (!use_rt_ && mode_ != "virtual") {
+        RCLCPP_WARN(rclcpp::get_logger("dsr_hw_interface2"),
+            "    RT unavailable: joint velocities are differentiated from position,"
+            " and motion is commanded with amovej instead of servoj_rt.");
+    }
+
     m_Drfl.setup_monitoring_version(1); //Enabling extended monitoring functions
 
     if(m_Drfl.GetRobotState() != STATE_STANDBY)    {
@@ -294,8 +327,8 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
     // Deactivate it.
     m_Drfl.set_auto_servo_off(0, 5.0);
 
-    // Virtual controller doesn't support real time connection.
-    if(mode_ != "virtual") {
+    // Only when the realtime stream was actually selected; see above.
+    if(use_rt_) {
         if(m_nVersionDRCF >= 3000000) {
             drcf_ip_ = drcf_rt_ip_;
         }
@@ -368,10 +401,10 @@ std::vector<hardware_interface::CommandInterface> DRHWInterface::export_command_
 }
 
 
-return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
 {
     const size_t expected_num_joints = joint_position_.size();
-    if(mode_ == "real") {
+    if(use_rt_) {
         const LPRT_OUTPUT_DATA_LIST data = m_Drfl.read_data_rt();
         if(nullptr == data) {
             RCLCPP_WARN(rclcpp::get_logger("dsr_hw_interface2"),
@@ -386,7 +419,9 @@ return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Dur
             joint_velocities_[idx_ros] = static_cast<float>(data->actual_joint_velocity[idx_control] * (M_PI / 180.0f));
             idx_ros++;
         }
-    }else if(mode_ == "virtual") {
+    }else {
+        // No realtime stream: read position over the DRL/TCP API. Used by the
+        // emulator, and by real controllers whose firmware does not serve RT.
         LPROBOT_POSE pose = m_Drfl.GetCurrentPose();
         if(nullptr == pose) {
             RCLCPP_WARN(rclcpp::get_logger("dsr_hw_interface2"),
@@ -399,9 +434,21 @@ return_type DRHWInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Dur
             }
             joint_position_[idx_ros++] = deg2rad(pose->_fPosition[idx_control]);
         }
-    }else {
-        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"), 
-                "'mode' is neither 'real' nor 'virtual.'" );
+
+        // GetCurrentPose reports position only. Leaving joint_velocities_ at its
+        // initial 0.0 would publish "the arm is stationary" while it is moving —
+        // wrong telemetry that watchdogs and execution monitors believe. So
+        // differentiate instead; noisier than the RT stream, but honest.
+        const double dt = period.seconds();
+        if (have_prev_position_ && dt > 1e-6 && prev_joint_position_.size() == expected_num_joints) {
+            for(size_t i = 0; i < expected_num_joints; i++) {
+                joint_velocities_[i] = (joint_position_[i] - prev_joint_position_[i]) / dt;
+            }
+        } else {
+            std::fill(joint_velocities_.begin(), joint_velocities_.end(), 0.0);
+        }
+        prev_joint_position_ = joint_position_;
+        have_prev_position_ = true;
     }
     // RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"), "[READ] joint_position_  : {%.3f, %.3f, %.3f, %.3f, %.3f, %.3f}"
     //     ,joint_position_[0]
@@ -522,9 +569,12 @@ return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &d
             }
         }
 
-        // Select control API
+        // Select control API. servoj_rt is an RT primitive: without the RT
+        // stream it silently does nothing, so anything that is not on RT — the
+        // emulator, and real controllers whose firmware does not serve it — has
+        // to command over the DRL/TCP API instead.
         std::string cmd_type;
-        if (mode_ == "real")
+        if (use_rt_)
         {
             float acc[g_k_default_num_joint] = {0,0,0,0,0,0};
             const float margin = 20.0f;
@@ -533,7 +583,7 @@ return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &d
             m_Drfl.servoj_rt(pos, vel, acc, servo_time);
             cmd_type = "servoj_rt";
         }
-        else  // virtual
+        else  // no RT stream: emulator, or pre-3.0.0 firmware
         {
             float target_vel_acc[g_k_default_num_joint] = {70,70,70,70,70,70};
             m_Drfl.amovej(pos, target_vel_acc, target_vel_acc);

@@ -90,5 +90,20 @@ private:
     int drcf_port_;
     int update_rate_;
     std::unordered_set<size_t> ignored_joints_;
+
+    // Realtime-stream selection. Older DRCF controllers (< 3.0.0) do not serve
+    // the RT stream at all, but connect_rt_control() still returns true on them
+    // and read_data_rt() then yields a zero-filled buffer rather than nullptr —
+    // so the failure is completely silent and joint feedback reads 0.0 forever.
+    // RT availability therefore cannot be probed; it is decided here instead.
+    //   "auto" (default) -> RT iff m_nVersionDRCF >= 3000000
+    //   "on"             -> force RT, fail loudly if it does not come up
+    //   "off"            -> never RT; read and write over the DRL/TCP API
+    std::string rt_mode_{"auto"};
+    bool use_rt_{false};
+    // Previous positions, for differentiating velocity on the TCP path:
+    // GetCurrentPose() reports position only.
+    std::vector<double> prev_joint_position_;
+    bool have_prev_position_{false};
 };
 }

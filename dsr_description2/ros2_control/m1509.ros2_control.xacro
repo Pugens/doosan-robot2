@@ -7,6 +7,7 @@
   rt_host:=0.0.0.0
   port:=12345
   mode:=real
+  rt_mode:=auto
   model:=m1509
   update_rate
   ">
@@ -23,6 +24,7 @@
         <param name="rt_host">${rt_host}</param>
         <param name="port">${port}</param>
         <param name="mode">${mode}</param>
+        <param name="rt_mode">${rt_mode}</param>
         <param name="model">${model}</param>
         <param name="update_rate">${update_rate}</param>
       </hardware>
