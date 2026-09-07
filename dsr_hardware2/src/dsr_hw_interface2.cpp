@@ -569,6 +569,14 @@ return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &d
             }
         }
 
+        // Whether the controller accepted the command. Every one of these
+        // returns a bool that upstream discarded, so a robot that refuses every
+        // setpoint looked identical to one tracking perfectly — and the
+        // trajectory controller has no tolerances configured, so it reports
+        // success either way. Silent refusal is exactly how the dead RT stream
+        // hid, so say something.
+        bool cmd_ok = true;
+
         // Select control API. servoj_rt is an RT primitive: without the RT
         // stream it silently does nothing, so anything that is not on RT — the
         // emulator, and real controllers whose firmware does not serve it — has
@@ -580,7 +588,7 @@ return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &d
             const float margin = 20.0f;
             float servo_time = static_cast<float>(real_loop_dt * margin);
 
-            m_Drfl.servoj_rt(pos, vel, acc, servo_time);
+            cmd_ok = m_Drfl.servoj_rt(pos, vel, acc, servo_time);
             cmd_type = "servoj_rt";
         }
         else if (mode_ == "real")
@@ -600,14 +608,22 @@ return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &d
             const float margin = 20.0f;
             float servo_time = static_cast<float>(real_loop_dt * margin);
 
-            m_Drfl.servoj(pos, limit_vel, limit_acc, servo_time, DR_SERVO_OVERRIDE);
+            cmd_ok = m_Drfl.servoj(pos, limit_vel, limit_acc, servo_time, DR_SERVO_OVERRIDE);
             cmd_type = "servoj";
         }
         else  // the DRCF emulator: keep upstream's amovej path untouched
         {
             float target_vel_acc[g_k_default_num_joint] = {70,70,70,70,70,70};
-            m_Drfl.amovej(pos, target_vel_acc, target_vel_acc);
+            cmd_ok = m_Drfl.amovej(pos, target_vel_acc, target_vel_acc);
             cmd_type = "amovej";
+        }
+
+        if (!cmd_ok) {
+            static rclcpp::Clock s_clock(RCL_STEADY_TIME);
+            RCLCPP_WARN_THROTTLE(
+                rclcpp::get_logger("dsr_hw_interface2"), s_clock, 2000,
+                "[write] %s was REJECTED by the controller — the arm is not following commands",
+                cmd_type.c_str());
         }
 
         // Debug logging
