@@ -297,7 +297,7 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
     if (!use_rt_ && mode_ != "virtual") {
         RCLCPP_WARN(rclcpp::get_logger("dsr_hw_interface2"),
             "    RT unavailable: joint velocities are differentiated from position,"
-            " and motion is commanded with amovej instead of servoj_rt.");
+            " and motion is streamed with servoj (DRL/TCP) instead of servoj_rt.");
     }
 
     m_Drfl.setup_monitoring_version(1); //Enabling extended monitoring functions
@@ -583,7 +583,27 @@ return_type DRHWInterface::write(const rclcpp::Time &, const rclcpp::Duration &d
             m_Drfl.servoj_rt(pos, vel, acc, servo_time);
             cmd_type = "servoj_rt";
         }
-        else  // no RT stream: emulator, or pre-3.0.0 firmware
+        else if (mode_ == "real")
+        {
+            // Real hardware without the RT stream. amovej is a *point-to-point
+            // move*: re-issuing it every control cycle restarts a fresh velocity
+            // profile each time, which makes the arm lurch at the start and end
+            // of a trajectory. servoj is the streaming primitive meant for
+            // exactly this, over the same DRL/TCP channel — dsr_controller2
+            // already exposes it as the servoj_stream topic.
+            //
+            // The limits bound the motion rather than setting it; passing the
+            // commanded velocity here would stall the arm wherever a trajectory
+            // legitimately passes through zero velocity.
+            float limit_vel[g_k_default_num_joint] = {70,70,70,70,70,70};
+            float limit_acc[g_k_default_num_joint] = {70,70,70,70,70,70};
+            const float margin = 20.0f;
+            float servo_time = static_cast<float>(real_loop_dt * margin);
+
+            m_Drfl.servoj(pos, limit_vel, limit_acc, servo_time, DR_SERVO_OVERRIDE);
+            cmd_type = "servoj";
+        }
+        else  // the DRCF emulator: keep upstream's amovej path untouched
         {
             float target_vel_acc[g_k_default_num_joint] = {70,70,70,70,70,70};
             m_Drfl.amovej(pos, target_vel_acc, target_vel_acc);
