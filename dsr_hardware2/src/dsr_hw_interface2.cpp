@@ -276,6 +276,26 @@ CallbackReturn DRHWInterface::on_init(const hardware_interface::HardwareInfo & i
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"    m_nVersionDRCF = %d", m_nVersionDRCF);  //ex> M2.40 = 120400, M2.50 = 120500  
     RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),"_______________________________________________\n");
 
+    //--- Compiled-for vs connected-to ---------------------------------------
+    // DRCF_VERSION is fixed at build time (colcon --cmake-args -DDRCF_VER=N) and
+    // selects which DRFL symbols this binary calls: digital I/O, the monitoring
+    // ctrl-IO callback, movec/amovec and force control all differ between 2 and
+    // 3. Upstream defaults it to 2, so a v3 controller is driven through the v2
+    // ABI unless someone knew to pass the flag. Nothing reported that, so say it
+    // plainly next to the version we actually connected to.
+    const int compiled_for = DRCF_VERSION;
+    const int connected_to = m_nVersionDRCF / 1000000;
+    RCLCPP_INFO(rclcpp::get_logger("dsr_hw_interface2"),
+        "    compiled for DRCF v%d, connected to DRCF v%d", compiled_for, connected_to);
+    if (connected_to > 0 && compiled_for != connected_to) {
+        RCLCPP_ERROR(rclcpp::get_logger("dsr_hw_interface2"),
+            "    DRCF VERSION MISMATCH: built for v%d but this controller is v%d. "
+            "Digital I/O, movec/amovec and force control will dispatch to the wrong "
+            "library symbols. Rebuild with: colcon build --cmake-args -DDRCF_VER=%d "
+            "(or set LAB_DRCF_VER=%d in .env and ./lab build).",
+            compiled_for, connected_to, connected_to, connected_to);
+    }
+
     //--- Decide whether the realtime stream is usable ----------------------
     // Not probed, because it cannot be: on a controller that does not serve the
     // RT stream, connect_rt_control() still returns true and read_data_rt()
